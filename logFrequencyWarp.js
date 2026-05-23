@@ -1,120 +1,157 @@
 /**
- * Utilities for warping a linear-frequency spectrum into a log-frequency
- * (equal-octave) representation and back.
+ * Utilities for warping between a linear-frequency FFT spectrum and a
+ * log-frequency (equal-octave) representation.
  *
- * In a standard FFT the bin spacing is linear: bin k = k * sampleRate / frameSize Hz.
- * That means a 20–40 Hz octave occupies the same number of bins as a 10000–20000 Hz
- * octave, so any "symmetric" rearrangement applied in linear bin space is wildly
- * asymmetric in musical terms.
+ * Why this matters:
+ *   A standard FFT has equal Hz spacing per bin, so a one-octave band at
+ *   100-200 Hz occupies ~5 bins while the same octave at 10000-20000 Hz
+ *   occupies ~465 bins (with a 44100 Hz / 2048 frame setup). Any symmetric
+ *   rearrangement applied in linear bin space is wildly asymmetric musically.
  *
- * By resampling to a log-frequency grid first, each octave occupies the same number
- * of grid slots, making transformations like flip and mirror behave musically.
+ * Key design choice — gather not scatter for log→linear:
+ *   When converting the rearranged log spectrum back to linear, we use a
+ *   gather: for each linear bin we compute its log-grid position and
+ *   interpolate. This ensures every linear bin gets a valid value.
+ *   Scatter (the alternative) leaves gaps wherever a small number of
+ *   log-slots needs to cover a large number of linear bins — exactly the
+ *   problematic region after a spectral flip.
  */
 
 /**
- * Build a table mapping each log-grid slot to a fractional linear bin position.
+ * Bundle of parameters that describe a log-frequency warp configuration.
+ * Build once per processAudioBuffer call and reuse across frames.
  *
- * @param {number} numberOfLogSlots   — how many slots in the log grid (typically halfFrameSize + 1)
- * @param {number} halfFrameSize      — halfFrameSize of the FFT (= frameSize / 2)
- * @param {number} lowestFrequencyHz  — lower bound for the log grid (avoid log(0))
- * @param {number} highestFrequencyHz — upper bound (typically sampleRate / 2)
- * @param {number} sampleRate
- * @returns {Float64Array}  fractional linear bin index for each log slot
+ * @typedef {Object} LogWarpConfig
+ * @property {number} numberOfLogSlots
+ * @property {number} halfFrameSize
+ * @property {number} lowestFrequencyHz
+ * @property {number} highestFrequencyHz
+ * @property {number} sampleRate
+ * @property {number} logOfLowestFrequency   — Math.log(lowestFrequencyHz), cached
+ * @property {number} logFrequencyRange      — Math.log(highestFrequencyHz) - logOfLowest, cached
  */
-export function buildLogToLinearBinTable(
+
+/**
+ * @param {number} numberOfLogSlots
+ * @param {number} halfFrameSize
+ * @param {number} lowestFrequencyHz
+ * @param {number} highestFrequencyHz
+ * @param {number} sampleRate
+ * @returns {LogWarpConfig}
+ */
+export function buildLogWarpConfig(
   numberOfLogSlots,
   halfFrameSize,
   lowestFrequencyHz,
   highestFrequencyHz,
   sampleRate,
 ) {
-  const logTable = new Float64Array(numberOfLogSlots);
-  const logLow  = Math.log(lowestFrequencyHz);
-  const logHigh = Math.log(highestFrequencyHz);
-
-  for (let slotIndex = 0; slotIndex < numberOfLogSlots; slotIndex++) {
-    const normalizedLogPosition = slotIndex / (numberOfLogSlots - 1); // 0..1
-    const frequencyHz = Math.exp(logLow + normalizedLogPosition * (logHigh - logLow));
-    logTable[slotIndex] = frequencyHz * (halfFrameSize * 2) / sampleRate; // fractional linear bin
-  }
-  return logTable;
+  return {
+    numberOfLogSlots,
+    halfFrameSize,
+    lowestFrequencyHz,
+    highestFrequencyHz,
+    sampleRate,
+    logOfLowestFrequency: Math.log(lowestFrequencyHz),
+    logFrequencyRange:    Math.log(highestFrequencyHz) - Math.log(lowestFrequencyHz),
+  };
 }
 
 /**
- * Resample a linear-frequency spectrum into a log-frequency grid using
- * linear interpolation between adjacent bins.
+ * Resample a linear-frequency spectrum to a log-frequency grid (gather).
+ * For each log slot, compute the corresponding fractional linear bin and
+ * linearly interpolate between the two adjacent bins.
  *
  * @param {Float64Array} linearReal
  * @param {Float64Array} linearImaginary
- * @param {Float64Array} logToLinearTable  — from buildLogToLinearBinTable
- * @param {number}       halfFrameSize
+ * @param {LogWarpConfig} config
  * @returns {{ logReal: Float64Array, logImaginary: Float64Array }}
  */
-export function resampleLinearToLog(linearReal, linearImaginary, logToLinearTable, halfFrameSize) {
-  const numberOfLogSlots = logToLinearTable.length;
+export function resampleLinearToLog(linearReal, linearImaginary, config) {
+  const {
+    numberOfLogSlots,
+    halfFrameSize,
+    sampleRate,
+    logOfLowestFrequency,
+    logFrequencyRange,
+  } = config;
+
   const logReal      = new Float64Array(numberOfLogSlots);
   const logImaginary = new Float64Array(numberOfLogSlots);
 
   for (let slotIndex = 0; slotIndex < numberOfLogSlots; slotIndex++) {
-    const fractionalLinearBin = logToLinearTable[slotIndex];
-    const lowerLinearBin = Math.floor(fractionalLinearBin);
-    const upperLinearBin = Math.min(lowerLinearBin + 1, halfFrameSize);
-    const interpolationWeight = fractionalLinearBin - lowerLinearBin;
+    const normalizedLogPosition  = slotIndex / (numberOfLogSlots - 1); // 0..1
+    const slotFrequencyHz        = Math.exp(logOfLowestFrequency + normalizedLogPosition * logFrequencyRange);
+    const fractionalLinearBin    = slotFrequencyHz * (halfFrameSize * 2) / sampleRate;
 
-    logReal[slotIndex] = linearReal[lowerLinearBin] * (1 - interpolationWeight)
-                       + linearReal[upperLinearBin] * interpolationWeight;
-    logImaginary[slotIndex] = linearImaginary[lowerLinearBin] * (1 - interpolationWeight)
-                            + linearImaginary[upperLinearBin] * interpolationWeight;
+    const lowerLinearBin         = Math.floor(fractionalLinearBin);
+    const upperLinearBin         = Math.min(lowerLinearBin + 1, halfFrameSize);
+    const upperInterpolationWeight = fractionalLinearBin - lowerLinearBin;
+    const lowerInterpolationWeight = 1 - upperInterpolationWeight;
+
+    logReal[slotIndex]      = linearReal[lowerLinearBin]      * lowerInterpolationWeight
+                            + linearReal[upperLinearBin]      * upperInterpolationWeight;
+    logImaginary[slotIndex] = linearImaginary[lowerLinearBin] * lowerInterpolationWeight
+                            + linearImaginary[upperLinearBin] * upperInterpolationWeight;
   }
 
   return { logReal, logImaginary };
 }
 
 /**
- * Resample a log-frequency spectrum back to a linear-frequency grid.
- * Each linear bin gathers its value from the nearest log slot.
- * Bins outside the log grid's frequency range are left at zero.
+ * Resample a log-frequency spectrum back to a linear-frequency grid (gather).
+ *
+ * For each linear bin, we invert the log mapping to find its fractional
+ * position in the log grid, then linearly interpolate between adjacent slots.
+ * This guarantees every linear bin gets a valid value — including high-
+ * frequency bins that would be left empty by a scatter approach when only a
+ * small number of log slots covers a large range of linear bins.
+ *
+ * Linear bins outside the log grid's [lowestHz, highestHz] range are zeroed.
  *
  * @param {Float64Array} logReal
  * @param {Float64Array} logImaginary
- * @param {Float64Array} logToLinearTable
- * @param {number}       halfFrameSize
+ * @param {LogWarpConfig} config
  * @returns {{ linearReal: Float64Array, linearImaginary: Float64Array }}
  */
-export function resampleLogToLinear(logReal, logImaginary, logToLinearTable, halfFrameSize) {
+export function resampleLogToLinear(logReal, logImaginary, config) {
+  const {
+    numberOfLogSlots,
+    halfFrameSize,
+    lowestFrequencyHz,
+    highestFrequencyHz,
+    sampleRate,
+    logOfLowestFrequency,
+    logFrequencyRange,
+  } = config;
+
   const numberOfPositiveBins = halfFrameSize + 1;
-  const linearReal      = new Float64Array(numberOfPositiveBins);
-  const linearImaginary = new Float64Array(numberOfPositiveBins);
-  const numberOfLogSlots = logToLinearTable.length;
+  const linearReal           = new Float64Array(numberOfPositiveBins);
+  const linearImaginary      = new Float64Array(numberOfPositiveBins);
 
-  // For each log slot, scatter its energy to the nearest linear bin.
-  // Multiple log slots can land on the same linear bin; we average them.
-  const contributionCount = new Float64Array(numberOfPositiveBins);
+  // DC (bin 0 = 0 Hz) is below the log grid — leave at zero
+  for (let linearBinIndex = 1; linearBinIndex <= halfFrameSize; linearBinIndex++) {
+    const binFrequencyHz = linearBinIndex * sampleRate / (halfFrameSize * 2);
 
-  for (let slotIndex = 0; slotIndex < numberOfLogSlots; slotIndex++) {
-    const fractionalLinearBin = logToLinearTable[slotIndex];
-    const lowerLinearBin = Math.floor(fractionalLinearBin);
-    const upperLinearBin = Math.min(lowerLinearBin + 1, halfFrameSize);
-    const upperWeight    = fractionalLinearBin - lowerLinearBin;
-    const lowerWeight    = 1 - upperWeight;
-
-    if (lowerLinearBin >= 0 && lowerLinearBin <= halfFrameSize) {
-      linearReal[lowerLinearBin]      += logReal[slotIndex]      * lowerWeight;
-      linearImaginary[lowerLinearBin] += logImaginary[slotIndex] * lowerWeight;
-      contributionCount[lowerLinearBin] += lowerWeight;
+    if (binFrequencyHz < lowestFrequencyHz || binFrequencyHz > highestFrequencyHz) {
+      // Outside the log grid range — leave at zero
+      continue;
     }
-    if (upperLinearBin !== lowerLinearBin && upperLinearBin <= halfFrameSize) {
-      linearReal[upperLinearBin]      += logReal[slotIndex]      * upperWeight;
-      linearImaginary[upperLinearBin] += logImaginary[slotIndex] * upperWeight;
-      contributionCount[upperLinearBin] += upperWeight;
-    }
-  }
 
-  for (let binIndex = 0; binIndex < numberOfPositiveBins; binIndex++) {
-    if (contributionCount[binIndex] > 1e-10) {
-      linearReal[binIndex]      /= contributionCount[binIndex];
-      linearImaginary[binIndex] /= contributionCount[binIndex];
-    }
+    // Invert the log mapping to get a fractional slot index
+    const fractionalSlotPosition = (Math.log(binFrequencyHz) - logOfLowestFrequency)
+                                 / logFrequencyRange
+                                 * (numberOfLogSlots - 1);
+
+    const lowerSlotIndex          = Math.floor(fractionalSlotPosition);
+    const upperSlotIndex          = Math.min(lowerSlotIndex + 1, numberOfLogSlots - 1);
+    const upperInterpolationWeight = fractionalSlotPosition - lowerSlotIndex;
+    const lowerInterpolationWeight = 1 - upperInterpolationWeight;
+
+    linearReal[linearBinIndex]      = logReal[lowerSlotIndex]      * lowerInterpolationWeight
+                                    + logReal[upperSlotIndex]      * upperInterpolationWeight;
+    linearImaginary[linearBinIndex] = logImaginary[lowerSlotIndex] * lowerInterpolationWeight
+                                    + logImaginary[upperSlotIndex] * upperInterpolationWeight;
   }
 
   return { linearReal, linearImaginary };

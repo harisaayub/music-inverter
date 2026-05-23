@@ -1,7 +1,7 @@
 import { fft } from './fft.js';
 import { rearrangeFrequencyBins } from './frequencyRearrangement.js';
 import {
-  buildLogToLinearBinTable,
+  buildLogWarpConfig,
   resampleLinearToLog,
   resampleLogToLinear,
 } from './logFrequencyWarp.js';
@@ -44,10 +44,10 @@ export function processAudioBuffer(inputBuffer, frameSize, hopFraction, mode, pa
     windowSquaredValues[sampleIndex] = hannWindowCoefficients[sampleIndex] ** 2;
   }
 
-  // Log-frequency warp table (built once per call, shared across channels and frames)
+  // Log-frequency warp config (built once per call, shared across channels and frames)
   const useLogFrequencyScale = parameters.useLogFrequencyScale;
-  const logToLinearBinTable = useLogFrequencyScale
-    ? buildLogToLinearBinTable(
+  const logWarpConfig = useLogFrequencyScale
+    ? buildLogWarpConfig(
         halfFrameSize + 1,
         halfFrameSize,
         LOWEST_LOG_FREQUENCY_HZ,
@@ -94,8 +94,7 @@ export function processAudioBuffer(inputBuffer, frameSize, hopFraction, mode, pa
         const { logReal, logImaginary } = resampleLinearToLog(
           positiveFrequencyReal,
           positiveFrequencyImaginary,
-          logToLinearBinTable,
-          halfFrameSize,
+          logWarpConfig,
         );
         rearrangementInputReal      = logReal;
         rearrangementInputImaginary = logImaginary;
@@ -119,8 +118,7 @@ export function processAudioBuffer(inputBuffer, frameSize, hopFraction, mode, pa
         const { linearReal, linearImaginary } = resampleLogToLinear(
           rearrangedReal,
           rearrangedImaginary,
-          logToLinearBinTable,
-          halfFrameSize,
+          logWarpConfig,
         );
         outputPositiveReal      = linearReal;
         outputPositiveImaginary = linearImaginary;
