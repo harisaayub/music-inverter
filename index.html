@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Frequency Mangler</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Courier New', monospace;
+    background: #0e0e0e;
+    color: #e0e0e0;
+    min-height: 100vh;
+    padding: 2rem;
+  }
+  h1 { font-size: 1.6rem; color: #7fd9ff; margin-bottom: 0.25rem; }
+  .subtitle { font-size: 0.8rem; color: #666; margin-bottom: 2rem; }
+
+  .card {
+    background: #1a1a1a;
+    border: 1px solid #2a2a2a;
+    border-radius: 8px;
+    padding: 1.5rem;
+    margin-bottom: 1rem;
+  }
+  .card h2 {
+    font-size: 0.75rem; color: #888; text-transform: uppercase;
+    letter-spacing: 0.1em; margin-bottom: 1rem;
+  }
+
+  .row {
+    display: flex; align-items: center; gap: 0.75rem;
+    margin-bottom: 0.75rem; flex-wrap: wrap;
+  }
+  .row label { font-size: 0.85rem; color: #aaa; min-width: 160px; }
+
+  input[type="range"] {
+    flex: 1; min-width: 120px; max-width: 280px;
+    accent-color: #7fd9ff; cursor: pointer;
+  }
+  input[type="number"] {
+    width: 90px; background: #252525; color: #7fd9ff;
+    border: 1px solid #3a3a3a; border-radius: 4px;
+    padding: 0.3rem 0.5rem; font-family: inherit; font-size: 0.8rem;
+    -moz-appearance: textfield;
+  }
+  input[type="number"]::-webkit-inner-spin-button,
+  input[type="number"]::-webkit-outer-spin-button { opacity: 0.4; }
+
+  select, input[type="file"] {
+    background: #252525; color: #e0e0e0; border: 1px solid #3a3a3a;
+    border-radius: 4px; padding: 0.35rem 0.6rem;
+    font-family: inherit; font-size: 0.85rem; cursor: pointer;
+  }
+  select { min-width: 180px; }
+
+  .unit-label { font-size: 0.75rem; color: #555; }
+
+  .mode-hint {
+    font-size: 0.75rem; color: #555; margin-top: 0.25rem;
+    line-height: 1.5; margin-bottom: 0.5rem;
+  }
+
+  .param-row { display: none; }
+  .param-row.active { display: flex; }
+
+  .checkbox-row { display: flex; align-items: center; gap: 0.75rem; margin-top: 0.5rem; }
+  .checkbox-row label { font-size: 0.85rem; color: #aaa; cursor: pointer; }
+  input[type="checkbox"] { accent-color: #7fd9ff; width: 1rem; height: 1rem; cursor: pointer; }
+
+  button {
+    background: #7fd9ff; color: #000; border: none; border-radius: 4px;
+    padding: 0.6rem 1.4rem; font-family: inherit; font-size: 0.9rem;
+    font-weight: bold; cursor: pointer; transition: background 0.15s;
+  }
+  button:hover { background: #a5e5ff; }
+  button:disabled { background: #333; color: #666; cursor: not-allowed; }
+
+  #status { font-size: 0.8rem; color: #666; margin-top: 0.75rem; min-height: 1.2em; }
+  #status.err { color: #ff6b6b; }
+  #status.ok  { color: #7fd9ff; }
+
+  audio { width: 100%; margin-top: 0.75rem; filter: invert(1) hue-rotate(180deg); }
+  .download-link {
+    display: inline-block; margin-top: 0.75rem;
+    background: #2a2a2a; color: #7fd9ff; border: 1px solid #3a3a3a;
+    border-radius: 4px; padding: 0.4rem 1rem;
+    font-size: 0.8rem; text-decoration: none; font-family: inherit;
+  }
+  .download-link:hover { background: #333; }
+</style>
+</head>
+<body>
+
+<h1>Frequency Mangler</h1>
+<p class="subtitle">FFT → rearrange spectrum → IFFT &mdash; runs entirely in-browser</p>
+
+<div class="card">
+  <h2>Input</h2>
+  <div class="row">
+    <label>Audio file</label>
+    <input type="file" id="fileInput" accept="audio/*">
+  </div>
+  <div class="row">
+    <label>Frame size</label>
+    <select id="frameSize">
+      <option value="512">512</option>
+      <option value="1024">1024</option>
+      <option value="2048" selected>2048</option>
+      <option value="4096">4096</option>
+      <option value="8192">8192</option>
+    </select>
+    <span class="unit-label" id="frameSizeHzPerBin"></span>
+  </div>
+  <div class="row">
+    <label>Overlap</label>
+    <select id="hopFraction">
+      <option value="0.5">50%</option>
+      <option value="0.25" selected>75%</option>
+      <option value="0.125">87.5%</option>
+    </select>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Transform</h2>
+  <div class="row">
+    <label>Mode</label>
+    <select id="mode">
+      <option value="flip">Spectral flip</option>
+      <option value="mirror">Mirror around frequency</option>
+      <option value="fold">Fold at frequency</option>
+      <option value="power">Power warp</option>
+      <option value="compress">Compress / stretch</option>
+      <option value="shift">Bin shift</option>
+    </select>
+  </div>
+  <p class="mode-hint" id="modeHint"></p>
+
+  <!-- flip ceiling — slider is a 0-1000 log-frequency position, JS converts to Hz -->
+  <div class="param-row row" id="param-row-flipCeilingHz">
+    <label>Flip ceiling</label>
+    <input type="range" id="flipCeilingHzSlider" min="0" max="1000" value="850" step="1">
+    <input type="number"  id="flipCeilingHz"       min="100" max="20000" value="10000" step="1">
+    <span class="unit-label">Hz</span>
+  </div>
+
+  <!-- mirror / fold frequency — same log-position scheme -->
+  <div class="param-row row" id="param-row-mirrorFrequencyHz">
+    <label>Mirror / fold freq</label>
+    <input type="range" id="mirrorFrequencyHzSlider" min="0" max="1000" value="600" step="1">
+    <input type="number"  id="mirrorFrequencyHz"       min="20" max="20000" value="4000" step="1">
+    <span class="unit-label">Hz</span>
+  </div>
+
+  <!-- power exponent -->
+  <div class="param-row row" id="param-row-powerExponent">
+    <label>Power exponent</label>
+    <input type="range" id="powerExponentSlider" min="0.1" max="4" value="0.5" step="0.01">
+    <input type="number"  id="powerExponent"       min="0.1" max="4" value="0.5" step="0.01">
+  </div>
+
+  <!-- compression ratio -->
+  <div class="param-row row" id="param-row-compressionRatio">
+    <label>Ratio</label>
+    <input type="range" id="compressionRatioSlider" min="0.05" max="4" value="0.5" step="0.01">
+    <input type="number"  id="compressionRatio"       min="0.05" max="4" value="0.5" step="0.01">
+    <span class="unit-label">×</span>
+  </div>
+
+  <!-- shift offset -->
+  <div class="param-row row" id="param-row-shiftOffsetInBins">
+    <label>Shift</label>
+    <input type="range" id="shiftOffsetInBinsSlider" min="-512" max="512" value="50" step="1">
+    <input type="number"  id="shiftOffsetInBins"       min="-512" max="512" value="50" step="1">
+    <span class="unit-label">bins</span>
+  </div>
+
+  <div class="checkbox-row">
+    <input type="checkbox" id="useLogFrequencyScale">
+    <label for="useLogFrequencyScale">
+      Log-frequency scale &mdash; rearrange in equal-octave space (more musical, slower)
+    </label>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Output</h2>
+  <button id="processButton" disabled>Process</button>
+  <p id="status">Load an audio file to begin.</p>
+  <div id="playerArea" style="display:none">
+    <audio id="audioPlayer" controls></audio><br>
+    <a id="downloadLink" class="download-link" download="mangled.wav">Download WAV</a>
+  </div>
+</div>
+
+<script type="module" src="./main.js"></script>
+</body>
+</html>
